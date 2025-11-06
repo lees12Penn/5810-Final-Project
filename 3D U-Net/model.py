@@ -42,7 +42,7 @@ class UNet(torch.nn.Module):
         self.layer5 = DoubleConv(256 + 128, 128)
         self.layer6 = DoubleConv(128+64, 64)
         self.layer7 = DoubleConv(64+32, 32)
-        self.layer8 = torch.nn.Conv3d(32, 3, 1)  # Output: 3 values -> background, liver, tumor
+        self.layer8 = torch.nn.Conv3d(32, 1, 1)
         #########################################
 
         self.maxpool = torch.nn.MaxPool3d(2)
