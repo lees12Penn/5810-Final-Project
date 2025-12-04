@@ -1,71 +1,75 @@
 from pathlib import Path
-
-import torch
+from torch.utils.data import Dataset
 import numpy as np
-import imgaug
-import imgaug.augmenters as iaa
+import torch
 from imgaug.augmentables.segmaps import SegmentationMapsOnImage
 
-class LungDataset(torch.utils.data.Dataset):
-    def __init__(self, root, augment_params):
-        self.all_files = self.extract_files(root)
-        self.augment_params = augment_params
-    
-    @staticmethod
-    def extract_files(root):
+class LungDataset(Dataset):
+    def __init__(self, root, seq=None, base_seed: int = 42):
         """
-        Extract the paths to all slices given the root path (ends with train or val)
-        """
-        files = []
-        for subject in root.glob("*"):   # Iterate over the subjects
-            slice_path = subject/"data"  # Get the slices for current subject
-            for slice in slice_path.glob("*"):
-                files.append(slice)
-        return files
-    
-    
-    @staticmethod
-    def change_img_to_label_path(path):
-        """
-        Replace data with mask to get the masks
-        """
-        parts = list(path.parts)
-        parts[parts.index("data")] = "masks"
-        return Path(*parts)
+        root examples (fold-level):
+          E:/.../Preprocessed_for_2D_Unet/splits/train/fold0/train
+          E:/.../Preprocessed_for_2D_Unet/splits/train/fold0/val
+          E:/.../Preprocessed_for_2D_Unet/splits/test
 
-    def augment(self, slice, mask):
+        Expected under each root:
+          root/image/<ID>/slice.npy
+          root/label_gtvp/<ID>/slice.npy
+
+        where <ID> is like 'Lung_014'.
         """
-        Augments slice and segmentation mask in the exact same way
-        Note the manual seed initialization
-        """
-        ###################IMPORTANT###################
-        # Fix for https://discuss.pytorch.org/t/dataloader-workers-generate-the-same-random-augmentations/28830/2
-        random_seed = torch.randint(0, 1000000, (1,))[0].item()
-        imgaug.seed(random_seed)
-        #####################################################
-        mask = SegmentationMapsOnImage(mask, mask.shape)
-        slice_aug, mask_aug = self.augment_params(image=slice, segmentation_maps=mask)
-        mask_aug = mask_aug.get_arr()
-        return slice_aug, mask_aug
-    
+        self.root = Path(root)
+        self.seq = seq
+        self.base_seed = base_seed
+        self.samples = []   # list of (img_path, lbl_path)
+
+        img_root = self.root / "image"
+        lbl_root = self.root / "label_gtvp"
+
+        print(f"[LungDataset] root      = {self.root}")
+        print(f"[LungDataset] img_root  = {img_root} (exists={img_root.exists()})")
+        print(f"[LungDataset] lbl_root  = {lbl_root} (exists={lbl_root.exists()})")
+
+        if not img_root.exists():
+            print("[LungDataset] WARNING: image root does not exist; dataset will be empty.")
+            return
+
+        # --- This is the key: recursively visit ID folders (Lung_014, Lung_XXX, ...) ---
+        img_paths = sorted(img_root.rglob("*.npy"))
+        print(f"[LungDataset] Found {len(img_paths)} image .npy files under {img_root}")
+
+        for ip in img_paths:
+            # rel path from image root: e.g. 'Lung_014/0.npy'
+            rel = ip.relative_to(img_root)
+            lp = lbl_root / rel
+            if not lp.exists():
+                print(f"[WARN] Missing label for {rel} -> {lp}")
+                continue
+            self.samples.append((ip, lp))
+
+        print(f"[LungDataset] Built {len(self.samples)} image–label slice pairs")
+
     def __len__(self):
-        """
-        Return the length of the dataset (length of all files)
-        """
-        return len(self.all_files)
-    
-    
+        return len(self.samples)
+
     def __getitem__(self, idx):
-        """
-        Given an index return the (augmented) slice and corresponding mask
-        Add another dimension for pytorch
-        """
-        file_path = self.all_files[idx]
-        mask_path = self.change_img_to_label_path(file_path)
-        slice = np.load(file_path)
-        mask = np.load(mask_path)
-        
-        if self.augment_params:
-            slice, mask = self.augment(slice, mask)
-        
-        return np.expand_dims(slice, 0), np.expand_dims(mask, 0)
+        img_path, lbl_path = self.samples[idx]
+
+        img = np.load(img_path).astype(np.float32)   # (H, W)
+        msk = np.load(lbl_path).astype(np.int32)     # (H, W)
+
+        # imgaug expects (H, W, C)
+        img_3c = img[..., None]
+        segmap = SegmentationMapsOnImage(msk, shape=img_3c.shape[:2])
+
+        if self.seq is not None:
+            det = self.seq.to_deterministic()
+            img_3c = det.augment_image(img_3c)
+            segmap = det.augment_segmentation_maps([segmap])[0]
+            msk = segmap.get_arr()
+
+        # to torch (C, H, W)
+        img_t = torch.from_numpy(img_3c.transpose(2, 0, 1))        # (1, H, W)
+        msk_t = torch.from_numpy(msk[None, ...].astype(np.int64))  # (1, H, W)
+
+        return img_t, msk_t
